@@ -1,232 +1,578 @@
 #!/usr/bin/env python3
+"""
+nicedates - Human-friendly date formatting for Taskwarrior reports
+version 1.0.0
+
+Usage:
+  nicedates [task args...]   Run task with nice date formatting
+  nicedates                  Toggle nicedates on/off in rc file
+  nicedates --status         Show current configuration
+  nicedates --help           Show this help
+
+Standalone or dispatched via tw wrapper.
+RC file: ~/.task/config/nicedates.rc (override: NICEDATES_RC env var)
+"""
 
 import sys
-import subprocess
+import os
 import re
-from datetime import datetime, timedelta
+import subprocess
+import select
+import pty
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
 
-def format_nice_date(date_str):
-    """Convert date string to nice relative format."""
-    try:
-        # Try various taskwarrior date output formats
-        for fmt in ["%Y-%m-%d", "%m/%d/%Y", "%d.%m.%Y", "%Y-%m-%d %H:%M:%S"]:
-            try:
-                dt = datetime.strptime(date_str.strip(), fmt)
-                break
-            except ValueError:
+# ============================================================================
+# Version
+# ============================================================================
+
+VERSION = "1.0.0"
+SCRIPT_NAME = os.path.basename(sys.argv[0])
+
+# ============================================================================
+# Non-report task commands (excluded from report detection)
+# ============================================================================
+
+TASK_COMMANDS = {
+    'add', 'modify', 'done', 'delete', 'denotate', 'annotate', 'append',
+    'prepend', 'duplicate', 'start', 'stop', 'import', 'export', 'purge',
+    'undo', 'sync', 'execute', 'edit', 'logo', 'diagnostics', 'show',
+    'config', 'context', 'help', 'version', 'calc', 'columns', 'commands',
+    'reports', 'stats', 'tags', 'projects', 'summary', 'timesheet',
+    'burndown', 'history', 'ghistory', 'calendar',
+}
+
+# ============================================================================
+# TW dateformat char → Python strftime mapping
+# ============================================================================
+
+TW_TO_STRFTIME = {
+    'Y': '%Y',   # four-digit year
+    'y': '%y',   # two-digit year
+    'M': '%m',   # two-digit month
+    'm': '%-m',  # minimal-digit month
+    'D': '%d',   # two-digit day
+    'd': '%-d',  # minimal-digit day
+    'b': '%b',   # short month name (Jan, Feb...)
+    'B': '%B',   # long month name
+    'A': '%A',   # long weekday name
+    'a': '%a',   # short weekday name
+    'H': '%H',   # two-digit hour
+    'h': '%-H',  # minimal-digit hour
+    'N': '%M',   # two-digit minutes (TW uses N, not M)
+    'n': '%-M',  # minimal-digit minutes
+    'S': '%S',   # two-digit seconds
+    's': '%-S',  # minimal-digit seconds
+    'V': '%V',   # two-digit week number
+    'v': '%-V',  # minimal-digit week number
+    'J': '%j',   # Julian day (zero-padded)
+    'j': '%-j',  # minimal Julian day
+    'w': '%w',   # weekday number (0=Sunday in strftime, 0=Monday in TW)
+}
+
+# ============================================================================
+# RC file handling
+# ============================================================================
+
+DEFAULT_RC_PATH = Path.home() / ".task" / "config" / "nicedates.rc"
+REPORTS_CACHE_PATH = Path(tempfile.gettempdir()) / "nicedates_reports_cache"
+
+DEFAULTS = {
+    'nicedates':             'on',
+    'nice.format.present':   'Yesterday,Today,Tomorrow',
+    'nice.format.week':      'A',
+    'nice.format.month':     'bm',
+    'nice.format.year':      "'y",
+    'nice.format.time':      'h:N',
+    'nice.conceal-times':    '00:00:00,23:59:59',
+    'nice.reports':          'any,-info,-all,-latest',
+    'nice.reports-cache-ttl': '24',
+}
+
+
+def get_rc_path():
+    """Return rc file path from env var or default."""
+    env = os.environ.get('NICEDATES_RC')
+    if env:
+        return Path(env)
+    return DEFAULT_RC_PATH
+
+
+def read_rc(rc_path):
+    """Parse nicedates.rc into a dict. Returns None if file not found."""
+    if not rc_path.exists():
+        return None
+
+    config = dict(DEFAULTS)  # start with defaults
+
+    with open(rc_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
                 continue
+            if '=' in line:
+                key, _, val = line.partition('=')
+                config[key.strip()] = val.strip()
+
+    return config
+
+
+def write_rc_toggle(rc_path, new_state):
+    """Toggle nicedates= value in rc file. Returns True on success."""
+    if not rc_path.exists():
+        print(f"[nicedates] RC file not found: {rc_path}", file=sys.stderr)
+        return False
+
+    lines = rc_path.read_text().splitlines(keepends=True)
+    found = False
+    new_lines = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('nicedates=') and not stripped.startswith('#'):
+            new_lines.append(f"nicedates={new_state}\n")
+            found = True
         else:
-            return date_str
-    except (ValueError, TypeError):
-        return date_str
-    
-    now = datetime.now()
+            new_lines.append(line)
+
+    if not found:
+        # Append it
+        new_lines.append(f"\nnicedates={new_state}\n")
+
+    rc_path.write_text(''.join(new_lines))
+    return True
+
+# ============================================================================
+# Report detection
+# ============================================================================
+
+def get_reports_list_cached(config):
+    """Get full task reports list, using cache with TTL."""
+    ttl_hours = float(config.get('nice.reports-cache-ttl', 24))
+    ttl_seconds = ttl_hours * 3600
+
+    # Check cache
+    if REPORTS_CACHE_PATH.exists():
+        age = time.time() - REPORTS_CACHE_PATH.stat().st_mtime
+        if age < ttl_seconds:
+            return set(REPORTS_CACHE_PATH.read_text().split())
+
+    # Refresh cache
+    try:
+        result = subprocess.run(
+            ['task', 'reports'],
+            capture_output=True, text=True, timeout=5
+        )
+        # Parse report names from output — first word of each data line
+        reports = set()
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if parts and parts[0].islower() and parts[0] not in TASK_COMMANDS:
+                reports.add(parts[0])
+
+        if reports:
+            REPORTS_CACHE_PATH.write_text('\n'.join(sorted(reports)))
+            return reports
+    except Exception:
+        pass
+
+    return set()
+
+
+def parse_nice_reports(reports_str, config):
+    """
+    Parse nice.reports= value into (positive_set, negative_set, use_any).
+
+    Examples:
+      'any,-info,-all'       → use_any=True,  negatives={'info','all'}
+      'next,list,overdue'    → use_any=False, positives={'next','list','overdue'}
+    """
+    parts = [p.strip() for p in reports_str.split(',') if p.strip()]
+    use_any = 'any' in parts
+    positives = set()
+    negatives = set()
+
+    for p in parts:
+        if p == 'any':
+            continue
+        elif p.startswith('-'):
+            negatives.add(p[1:])
+        else:
+            positives.add(p)
+
+    return use_any, positives, negatives
+
+
+def get_known_reports(use_any, positives, config):
+    """Return the set of known report names to match against."""
+    if use_any:
+        return get_reports_list_cached(config)
+    else:
+        return positives
+
+
+def detect_report(args, known_reports, negatives):
+    """
+    Scan args for the first bare word that is a known report name
+    and not in the negatives set.
+
+    A bare word: no ':', no '+'/'-' prefix, not 'rc.*', not a number,
+    not a tw flag, not a task command.
+
+    Returns report name or None.
+    """
+    for arg in args:
+        # Skip rc overrides
+        if arg.startswith('rc.') or arg.startswith('rc:'):
+            continue
+        # Skip filters: tags, attribute:value, numbers
+        if arg.startswith('+') or arg.startswith('-'):
+            continue
+        if ':' in arg:
+            continue
+        if arg.isdigit():
+            continue
+        # Skip tw flags
+        if arg.startswith('--') or (arg.startswith('-') and len(arg) == 2):
+            continue
+        # Must be lowercase word (report names are lowercase)
+        if not re.match(r'^[a-z][a-z0-9_]*$', arg):
+            continue
+        # Not a non-report command
+        if arg in TASK_COMMANDS:
+            continue
+        # Check against known reports
+        if arg in known_reports and arg not in negatives:
+            return arg
+
+    return None
+
+# ============================================================================
+# Date formatting
+# ============================================================================
+
+def tw_format_to_strftime(tw_fmt):
+    """Convert a TW dateformat string to a Python strftime format string."""
+    result = []
+    i = 0
+    while i < len(tw_fmt):
+        ch = tw_fmt[i]
+        if ch in TW_TO_STRFTIME:
+            result.append(TW_TO_STRFTIME[ch])
+        elif ch == "'":
+            # TW escape: ' makes next char literal.
+            # nicedates extension: '' (double apostrophe) outputs a literal
+            # apostrophe and processes the char AFTER as a normal format code.
+            # e.g. ''y  → '27   (apostrophe + 2-digit year)
+            # e.g. 'y   → y    (literal y, not a format code)
+            i += 1
+            if i < len(tw_fmt):
+                next_ch = tw_fmt[i]
+                if next_ch == "'":
+                    # '' → emit literal apostrophe; next char (i+1) processed
+                    # normally by the following loop iteration.
+                    result.append("'")
+                    # i points at second '; i+=1 at bottom moves past it,
+                    # so the char after '' is processed next. Correct.
+                else:
+                    # Single apostrophe → next char is literal
+                    result.append(next_ch)
+        else:
+            result.append(ch)
+        i += 1
+    return ''.join(result)
+
+
+def format_nice_date(dt, now, config):
+    """
+    Apply nice.format.* rules to produce a human-friendly date string.
+    Returns (date_str, time_str_or_None).
+    """
     today = now.replace(hour=0, minute=0, second=0, microsecond=0)
     task_date = dt.replace(hour=0, minute=0, second=0, microsecond=0)
-    
     delta_days = (task_date - today).days
-    
-    # Yesterday, Today, Tomorrow
+
+    present_labels = config.get('nice.format.present', 'Yesterday,Today,Tomorrow').split(',')
+    yesterday_label = present_labels[0] if len(present_labels) > 0 else 'Yesterday'
+    today_label     = present_labels[1] if len(present_labels) > 1 else 'Today'
+    tomorrow_label  = present_labels[2] if len(present_labels) > 2 else 'Tomorrow'
+
     if delta_days == -1:
-        return "Yesterday"
+        date_str = yesterday_label
     elif delta_days == 0:
-        return "Today"
+        date_str = today_label
     elif delta_days == 1:
-        return "Tomorrow"
-    
-    # Within next 6 days: day name
+        date_str = tomorrow_label
     elif 2 <= delta_days <= 7:
-        return dt.strftime("%A")
-    
-    # Same year: MonthDay format (no leading zero)
+        # Within next week: apply nice.format.week
+        fmt = tw_format_to_strftime(config.get('nice.format.week', 'A'))
+        date_str = dt.strftime(fmt)
     elif dt.year == now.year:
-        month = dt.strftime("%b")
-        day = dt.day
-        return f"{month}{day}"
-    
-    # Different year: Month Day-YY format
+        # Same year: apply nice.format.month
+        fmt = tw_format_to_strftime(config.get('nice.format.month', 'bm'))
+        date_str = dt.strftime(fmt)
     else:
-        month = dt.strftime("%b")
-        day = dt.day
-        year_short = str(dt.year)[2:]
-        return f"{month} {day}-{year_short}"
+        # Different year: apply nice.format.year
+        fmt = tw_format_to_strftime(config.get('nice.format.year', "'y"))
+        date_str = dt.strftime(fmt)
+
+    # Time handling
+    time_str = None
+    time_fmt_tw = config.get('nice.format.time', 'h:N')
+    conceal_times = set(config.get('nice.conceal-times', '00:00:00,23:59:59').split(','))
+
+    raw_time = dt.strftime('%H:%M:%S')
+    if raw_time not in conceal_times:
+        time_fmt = tw_format_to_strftime(time_fmt_tw)
+        time_str = dt.strftime(time_fmt)
+
+    return date_str, time_str
+
+# ============================================================================
+# ANSI-aware line processing
+# ============================================================================
+
+ANSI_PATTERN = re.compile(r'\x1b\[[0-9;]*m')
+# Matches the forced format: YYYY-MM-DD HH:MM:SS
+DATE_TIME_PATTERN = re.compile(r'(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})')
+
 
 def strip_ansi(text):
-    """Remove ANSI color codes from text."""
-    ansi_escape = re.compile(r'\x1b\[[0-9;]*m')
-    return ansi_escape.sub('', text)
+    return ANSI_PATTERN.sub('', text)
 
-def replace_dates(line):
-    """Replace dates in a line with nice format, preserving column alignment."""
-    # Match common date patterns, including with time
-    patterns = [
-        (r'\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', 19),  # 2026-01-03 12:00:00
-        (r'\d{4}-\d{2}-\d{2}', 10),  # 2026-01-03
-        (r'\d{2}/\d{2}/\d{4}', 10),  # 01/03/2026
-        (r'\d{1,2}/\d{1,2}/\d{4}', 10),  # 1/3/2026
-        (r'\d{2}\.\d{2}\.\d{4}', 10), # 03.01.2026
-        (r'\d{1,2}\.\d{1,2}\.\d{4}', 10), # 3.1.2026
-    ]
-    
-    # We need to preserve ANSI codes while replacing dates
-    # Work with stripped version to find dates, then apply to original
-    stripped = strip_ansi(line)
-    
-    # Collect all replacements with their positions in stripped text
-    replacements = []
-    
-    for pattern, default_width in patterns:
-        for match in re.finditer(pattern, stripped):
-            date_str = match.group()
-            nice_date = format_nice_date(date_str)
-            
-            # Pad to maintain column alignment
-            original_width = len(date_str)
-            nice_width = len(nice_date)
-            
-            if nice_width < original_width:
-                # Pad with spaces on the right
-                nice_date = nice_date + ' ' * (original_width - nice_width)
-            elif nice_width > original_width:
-                # Truncate if somehow longer (shouldn't happen often)
-                nice_date = nice_date[:original_width]
-            
-            replacements.append((match.start(), match.end(), nice_date))
-    
-    # Sort by position and apply in reverse to maintain indices
-    replacements.sort(reverse=True)
-    
-    # Now apply to original line (with ANSI codes)
-    # We need to map positions in stripped text to positions in original
-    result = line
-    ansi_offset = 0
-    stripped_pos = 0
-    original_pos = 0
-    
-    # Build a mapping of stripped positions to original positions
+
+def build_pos_map(line):
+    """Map stripped-text positions → original line positions."""
     pos_map = {}
-    i = 0
-    j = 0
-    ansi_pattern = re.compile(r'\x1b\[[0-9;]*m')
-    
+    i = 0  # position in original line
+    j = 0  # position in stripped text
     while i < len(line):
-        # Check if we're at an ANSI code
-        ansi_match = ansi_pattern.match(line[i:])
-        if ansi_match:
-            # Skip the ANSI code
-            i += ansi_match.end()
+        m = ANSI_PATTERN.match(line[i:])
+        if m:
+            i += m.end()
         else:
-            # Regular character
             pos_map[j] = i
             i += 1
             j += 1
-    pos_map[j] = len(line)  # End position
-    
-    # Apply replacements using the position map
+    pos_map[j] = len(line)
+    return pos_map
+
+
+def replace_dates_in_line(line, now, config):
+    """Replace YYYY-MM-DD HH:MM:SS patterns in a line with nice dates."""
+    stripped = strip_ansi(line)
+
+    replacements = []  # (start, end, replacement_str) in stripped coords
+
+    for m in DATE_TIME_PATTERN.finditer(stripped):
+        date_part = m.group(1)
+        time_part = m.group(2)
+        full_str  = m.group(0)  # "YYYY-MM-DD HH:MM:SS"
+
+        try:
+            dt = datetime.strptime(full_str, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            continue
+
+        date_str, time_str = format_nice_date(dt, now, config)
+
+        if time_str:
+            nice = f"{date_str} {time_str}"
+        else:
+            nice = date_str
+
+        original_width = len(full_str)
+        nice_width = len(nice)
+
+        # Pad to preserve column alignment
+        if nice_width < original_width:
+            nice = nice + ' ' * (original_width - nice_width)
+        elif nice_width > original_width:
+            nice = nice[:original_width]
+
+        replacements.append((m.start(), m.end(), nice))
+
+    if not replacements:
+        return line
+
+    # Apply replacements in reverse order using position map
+    pos_map = build_pos_map(line)
+    replacements.sort(reverse=True)
+    result = line
+
     for start, end, replacement in replacements:
         if start in pos_map and end in pos_map:
             orig_start = pos_map[start]
-            orig_end = pos_map[end]
+            orig_end   = pos_map[end]
             result = result[:orig_start] + replacement + result[orig_end:]
-            
-            # Update the position map for subsequent replacements
+
+            # Update pos_map for remaining replacements
             offset = len(replacement) - (orig_end - orig_start)
-            new_pos_map = {}
+            new_map = {}
             for k, v in pos_map.items():
                 if v < orig_start:
-                    new_pos_map[k] = v
+                    new_map[k] = v
                 elif v >= orig_end:
-                    new_pos_map[k] = v + offset
-            pos_map = new_pos_map
-    
+                    new_map[k] = v + offset
+            pos_map = new_map
+
     return result
 
-def main():
-    """Main wrapper entry point."""
-    # Build taskwarrior command
-    args = sys.argv[1:]  # Get all arguments after script name
-    
-    # Always add forcecolor to preserve colors through the pipe
-    args = ['rc._forcecolor=on'] + args
-    
-    # Run taskwarrior with a pseudo-TTY to preserve width and colors
-    try:
-        # Use script command to provide a pty, which makes task think it's interactive
-        import os
-        import pty
-        import select
-        
-        # Get terminal size
-        rows, cols = os.get_terminal_size()
-        
-        # Set up environment
-        env = os.environ.copy()
-        env['COLUMNS'] = str(cols)
-        env['LINES'] = str(rows)
-        
-        # Create a pseudo-terminal
-        master, slave = pty.openpty()
-        
-        # Start taskwarrior process
-        proc = subprocess.Popen(
-            ['task'] + args,
-            stdin=slave,
-            stdout=slave,
-            stderr=slave,
-            env=env
-        )
-        
-        os.close(slave)
-        
-        # Read output and process it
-        output = b''
-        while True:
-            ready, _, _ = select.select([master], [], [], 0.1)
-            if ready:
-                try:
-                    chunk = os.read(master, 1024)
-                    if not chunk:
-                        break
-                    output += chunk
-                except OSError:
-                    break
-            elif proc.poll() is not None:
-                # Process finished, read any remaining output
-                try:
-                    chunk = os.read(master, 1024)
-                    output += chunk
-                except OSError:
-                    pass
-                break
-        
-        os.close(master)
-        proc.wait()
-        
-        # Decode and process output
-        text_output = output.decode('utf-8', errors='replace')
-        output_lines = text_output.split('\n')
-        for line in output_lines:
-            print(replace_dates(line))
-        
-        sys.exit(proc.returncode)
-        
-    except Exception as e:
-        # Fallback to simple method if pty fails
-        print(f"PTY method failed, using fallback: {e}", file=sys.stderr)
-        result = subprocess.run(
-            ['task'] + args,
-            capture_output=True,
-            text=True
-        )
-        
-        output_lines = result.stdout.split('\n')
-        for line in output_lines:
-            print(replace_dates(line))
-        
-        if result.stderr:
-            print(result.stderr, end='', file=sys.stderr)
-        
-        sys.exit(result.returncode)
+# ============================================================================
+# Task execution via PTY (unchanged from working implementation)
+# ============================================================================
 
-if __name__ == "__main__":
+def run_task_with_nicedates(args, config):
+    """Run task with PTY, post-processing output through nicedates."""
+    # Inject dateformat override to expose times
+    full_args = ['rc._forcecolor=on', 'rc.dateformat=Y-M-D H:N:S'] + args
+
+    now = datetime.now()
+
+    try:
+        rows, cols = os.get_terminal_size()
+    except OSError:
+        rows, cols = 24, 80
+
+    env = os.environ.copy()
+    env['COLUMNS'] = str(cols)
+    env['LINES']   = str(rows)
+
+    master, slave = pty.openpty()
+
+    proc = subprocess.Popen(
+        ['task'] + full_args,
+        stdin=slave, stdout=slave, stderr=slave,
+        env=env
+    )
+    os.close(slave)
+
+    output = b''
+    while True:
+        ready, _, _ = select.select([master], [], [], 0.1)
+        if ready:
+            try:
+                chunk = os.read(master, 1024)
+                if not chunk:
+                    break
+                output += chunk
+            except OSError:
+                break
+        elif proc.poll() is not None:
+            try:
+                chunk = os.read(master, 1024)
+                output += chunk
+            except OSError:
+                pass
+            break
+
+    os.close(master)
+    proc.wait()
+
+    text = output.decode('utf-8', errors='replace')
+    for line in text.split('\n'):
+        print(replace_dates_in_line(line, now, config))
+
+    sys.exit(proc.returncode)
+
+
+def run_task_passthrough(args):
+    """Pass through to task unchanged (nicedates inactive)."""
+    os.execvp('task', ['task'] + args)
+
+# ============================================================================
+# Toggle / status
+# ============================================================================
+
+def do_toggle(rc_path, config):
+    """Toggle nicedates on↔off and report new state."""
+    if config is None:
+        print(f"[nicedates] RC file not found: {rc_path}")
+        print(f"[nicedates] Create it at {rc_path} to use nicedates.")
+        sys.exit(1)
+
+    current = config.get('nicedates', 'on').lower()
+    new_state = 'off' if current == 'on' else 'on'
+
+    if write_rc_toggle(rc_path, new_state):
+        print(f"[nicedates] {current} → {new_state}")
+    else:
+        sys.exit(1)
+
+
+def do_status(rc_path, config):
+    """Show current nicedates configuration."""
+    print(f"nicedates v{VERSION}")
+    print(f"RC file : {rc_path} ({'found' if rc_path.exists() else 'NOT FOUND'})")
+
+    if config is None:
+        print("Status  : inactive (no RC file)")
+        return
+
+    state = config.get('nicedates', 'on')
+    print(f"State   : {state}")
+    print(f"Reports : {config.get('nice.reports', DEFAULTS['nice.reports'])}")
+    print(f"Present : {config.get('nice.format.present', DEFAULTS['nice.format.present'])}")
+    print(f"Week    : {config.get('nice.format.week', DEFAULTS['nice.format.week'])}")
+    print(f"Month   : {config.get('nice.format.month', DEFAULTS['nice.format.month'])}")
+    print(f"Year    : {config.get('nice.format.year', DEFAULTS['nice.format.year'])}")
+    print(f"Time    : {config.get('nice.format.time', DEFAULTS['nice.format.time'])}")
+    print(f"Conceal : {config.get('nice.conceal-times', DEFAULTS['nice.conceal-times'])}")
+    print(f"Cache TTL: {config.get('nice.reports-cache-ttl', DEFAULTS['nice.reports-cache-ttl'])}h")
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main():
+    args = sys.argv[1:]
+
+    # Help / version flags
+    if args and args[0] in ('-h', '--help'):
+        print(__doc__)
+        sys.exit(0)
+    if args and args[0] in ('-v', '--version'):
+        print(f"nicedates v{VERSION}")
+        sys.exit(0)
+
+    rc_path = get_rc_path()
+    config  = read_rc(rc_path)
+
+    # Status flag
+    if args and args[0] == '--status':
+        do_status(rc_path, config)
+        sys.exit(0)
+
+    # No args (or dispatched with no task args) → toggle
+    if not args:
+        do_toggle(rc_path, config)
+        sys.exit(0)
+
+    # ── Early exit checks ────────────────────────────────────────────────────
+
+    # 1. RC file must exist
+    if config is None:
+        run_task_passthrough(args)
+
+    # 2. nicedates must be on
+    if config.get('nicedates', 'on').lower() != 'on':
+        run_task_passthrough(args)
+
+    # 3. Determine selected report set
+    reports_str = config.get('nice.reports', DEFAULTS['nice.reports'])
+    use_any, positives, negatives = parse_nice_reports(reports_str, config)
+    known_reports = get_known_reports(use_any, positives, config)
+
+    # 4. Detect if args contain a selected report
+    report = detect_report(args, known_reports, negatives)
+    if report is None:
+        run_task_passthrough(args)
+
+    # ── All checks passed — run with nicedates ───────────────────────────────
+    run_task_with_nicedates(args, config)
+
+
+if __name__ == '__main__':
     main()

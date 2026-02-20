@@ -1,90 +1,91 @@
-# nicedates.rc (proposed) 
-# version ?.?.?
+# nicedates.rc
+# version 1.0.0
+#
+# Human-friendly date formatting for Taskwarrior reports.
+#
+# INSTALLATION
+#   Add to your ~/.taskrc:
+#     include ~/.task/config/nicedates.rc
+#
+# TOGGLE
+#   nicedates         (standalone) or   tw nicedates
+#   nicedates --status                  show current config
+#
+#====================================================================
+# ACTIVATION
+#   nicedates=on      nicedates is active
+#   nicedates=off     nicedates is inactive (pass-through only)
+#====================================================================
 
-# to switch nicedates on/ off use command nice-on or nice-off
 nicedates=on
 
-# nicedates is enabled by adding to your .taskrc
-#   include ~/.task/config/nicedates.rc
-# and deactivated by removing/ commenting out that line
+#====================================================================
+# REPORT SELECTION
 #
-#====================================
-# from man taskrc;
+# Controls which reports nicedates transforms.
 #
-#       This is a string of characters that defines how Taskwarrior formats date values.  The precedence order for the configuration variable is report.X.dateformat then  datefor‐
-#       mat.report  then  dateformat for formatting the due dates in reports.  If both report.X.dateformat and dateformat.report are not set then dateformat will be applied to the
-#       date. Entered dates as well as all other displayed dates in reports are formatted according to dateformat.
+# Syntax:
+#   any               start with all known reports
+#   -reportname       exclude this report (requires 'any')
+#   report1,report2   positive list — only these reports
 #
-#       The default value is the ISO-8601 standard: Y-M-D. The string can contain the characters:
+# Examples:
+#   any,-info,-all,-latest    all reports except info, all, latest
+#   next,list,overdue         only these three reports
 #
-#              m  minimal-digit month,    for example 1 or 12
-#              d  minimal-digit day,      for example 1 or 30
-#              y  two-digit year,         for example 09 or 12
-#              D  two-digit day,          for example 01 or 30
-#              M  two-digit month,        for example 01 or 12
-#              Y  four-digit year,        for example 2009 or 2015
-#              a  short name of weekday,  for example Mon or Wed
-#              A  long name of weekday,   for example Monday or Wednesday
-#              b  short name of month,    for example Jan or Aug
-#              B  long name of month,     for example January or August
-#              v  minimal-digit week,     for example 3 or 37
-#              V  two-digit week,         for example 03 or 37
-#              h  minimal-digit hour,     for example 3 or 21
-#              n  minimal-digit minutes,  for example 5 or 42
-#              s  minimal-digit seconds,  for example 7 or 47
-#              H  two-digit hour,         for example 03 or 21
-#              N  two-digit minutes,      for example 05 or 42
-#              S  two-digit seconds,      for example 07 or 47
-#              J  three-digit Julian day, for example 023 or 365
-#              j  Julian day,             for example 23 or 365
-#              w  Week day,               for example 0 for Monday, 5 for Friday
+# Note: 'any' triggers a 'task reports' lookup (cached, see TTL below)
+#====================================================================
+
+nice.reports=any,-info,-all,-latest
+
+# Cache TTL for 'task reports' list, in hours (default: 24)
+# Increase if startup feels slow; decrease if you add custom reports often
+nice.reports-cache-ttl=24
+
+#====================================================================
+# DATE FORMAT SETTINGS
 #
-#       The characters 'v', 'V', 'a' and 'A' can only be used for formatting printed dates (not to parse them).
+# Uses Taskwarrior dateformat characters:
+#   Y=4-digit year   y=2-digit year   M=2-digit month   m=1-2 digit month
+#   D=2-digit day    d=1-2 digit day  b=short month     B=long month
+#   A=long weekday   a=short weekday  H=2-digit hour    h=1-2 digit hour
+#   N=2-digit min    n=1-2 digit min
+#   Use ' to escape literal characters (e.g. 'y for apostrophe+year)
 #
-#       The string may also contain other characters to act as spacers, or formatting.  Examples for other values of dateformat:
-#
-#              d/m/Y  would use for input and output 24/7/2009
-#                   yMD    would use for input and output 090724
-#                   M-D-Y  would use for input and output 07-24-2009
-#
-#=========================================
-#   global values
-# Un-comment and modify to override taskwarrior defaults.
-# These values will be used when nicedates is off (nice-off)
-# and for reports that are de-selected 
-# (see nice.reports= setting below)
-#
-#  DATES
-#dateformat=Y-M-D
-#
-#dateformat.report=
-#
-#dateformat.holiday=YMD
-#
-#dateformat.edit=Y-M-D H:N:S
-#
-#dateformat.info=Y-M-D H:N:S
-#
-#dateformat.annotation=
-#
-# (set format for specified reports)
-#report.X.dateformat=Y-M-D
-#
-#
-#
-#===========================================
+# nice.format.present  Labels for yesterday/today/tomorrow (comma-separated)
+# nice.format.week     Format for dates 2-7 days away
+# nice.format.month    Format for dates later this year
+# nice.format.year     Format for dates in other years
+# nice.format.time     Format for time portion (when not concealed)
+#====================================================================
 
 nice.format.present=Yesterday,Today,Tomorrow
 nice.format.week=A
 nice.format.month=bm
-nice.format.year='y
+# ''y: double-apostrophe escape = literal apostrophe + 2-digit year → '26
+# (single 'y would produce literal "y" per standard TW escape rules)
+nice.format.year=''y
 nice.format.time=h:N
+
+#====================================================================
+# TIME CONCEALMENT
+#
+# Comma-separated list of HH:MM:SS times to suppress from display.
+# These are typically Taskwarrior's default "no time set" sentinels.
+# Time is hidden entirely when matched (date portion still shown).
+#====================================================================
+
 nice.conceal-times=00:00:00,23:59:59
-nice.reports=any,-info,-all,-latest
 
+#====================================================================
+# GLOBAL DATEFORMAT OVERRIDES (optional)
+#
+# These apply when nicedates is off, or for non-selected reports.
+# Uncomment and set as desired.
+#====================================================================
 
-
-
-
-
-
+#dateformat=Y-M-D
+#dateformat.report=
+#dateformat.edit=Y-M-D H:N:S
+#dateformat.info=Y-M-D H:N:S
+#dateformat.annotation=
