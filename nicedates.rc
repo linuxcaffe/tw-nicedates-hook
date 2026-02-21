@@ -36,7 +36,7 @@ nicedates=on
 # Note: 'any' triggers a 'task reports' lookup (cached, see TTL below)
 #====================================================================
 
-nice.reports=any,-info,-all,-latest
+nice.reports=any,-info,-all,-latest,-long
 
 # Cache TTL for 'task reports' list, in hours (default: 24)
 # Increase if startup feels slow; decrease if you add custom reports often

@@ -28,8 +28,8 @@ from pathlib import Path
 # Version
 # ============================================================================
 
-VERSION = "1.0.0"
-SCRIPT_NAME = os.path.basename(sys.argv[0])
+VERSION = "1.0.1"
+SCRIPT_NAME = "nicedates"
 
 # ============================================================================
 # Non-report task commands (excluded from report detection)
@@ -84,11 +84,14 @@ DEFAULTS = {
     'nice.format.present':   'Yesterday,Today,Tomorrow',
     'nice.format.week':      'A',
     'nice.format.month':     'bm',
-    'nice.format.year':      "'y",
+    'nice.format.year':      "''y",
     'nice.format.time':      'h:N',
     'nice.conceal-times':    '00:00:00,23:59:59',
     'nice.reports':          'any,-info,-all,-latest',
     'nice.reports-cache-ttl': '24',
+    # rc.verbose tokens to suppress — 'override' silences rc.* override messages.
+    # Modify manually if other tokens need suppressing. Set to '' to disable.
+    'nice.suppress-verbose': 'override',
 }
 
 
@@ -314,9 +317,10 @@ def format_nice_date(dt, now, config):
         fmt = tw_format_to_strftime(config.get('nice.format.month', 'bm'))
         date_str = dt.strftime(fmt)
     else:
-        # Different year: apply nice.format.year
-        fmt = tw_format_to_strftime(config.get('nice.format.year', "'y"))
-        date_str = dt.strftime(fmt)
+        # Different year: combine nice.format.month + nice.format.year
+        month_fmt = tw_format_to_strftime(config.get('nice.format.month', 'bm'))
+        year_fmt  = tw_format_to_strftime(config.get('nice.format.year', "''y"))
+        date_str  = dt.strftime(month_fmt) + dt.strftime(year_fmt)
 
     # Time handling
     time_str = None
@@ -426,8 +430,20 @@ def replace_dates_in_line(line, now, config):
 
 def run_task_with_nicedates(args, config):
     """Run task with PTY, post-processing output through nicedates."""
-    # Inject dateformat override to expose times
-    full_args = ['rc._forcecolor=on', 'rc.dateformat=Y-M-D H:N:S'] + args
+    # Build rc overrides
+    rc_overrides = ['rc._forcecolor=on', 'rc.dateformat=Y-M-D H:N:S']
+
+    # Suppress rc.override messages (and any other configured verbose tokens)
+    suppress = config.get('nice.suppress-verbose', 'override').strip()
+    if suppress:
+        # Get existing verbose setting, remove suppressed tokens, apply
+        # We inject rc.verbose= to exclude the suppressed token(s).
+        # Format: rc.verbose=all,-override  (start with all, remove token)
+        suppress_tokens = [t.strip() for t in suppress.split(',') if t.strip()]
+        verbose_val = 'all,' + ','.join(f'-{t}' for t in suppress_tokens)
+        rc_overrides.append(f'rc.verbose={verbose_val}')
+
+    full_args = rc_overrides + args
 
     now = datetime.now()
 
@@ -526,7 +542,19 @@ def do_status(rc_path, config):
 # Main
 # ============================================================================
 
-def main():
+def run_as_stdin_filter(config):
+    """
+    Filter mode: read task output from stdin, write transformed output to stdout.
+    Used when tw pipes task output through nicedates as a filter wrapper.
+    """
+    now = datetime.now()
+    for line in sys.stdin:
+        # Strip trailing newline, process, re-add
+        sys.stdout.write(replace_dates_in_line(line.rstrip('\n'), now, config) + '\n')
+    sys.stdout.flush()
+
+
+
     args = sys.argv[1:]
 
     # Help / version flags
@@ -540,12 +568,22 @@ def main():
     rc_path = get_rc_path()
     config  = read_rc(rc_path)
 
+    # ── Piped stdin filter mode (called by tw as a filter wrapper) ────────────
+    # When tw pipes task output through nicedates, stdin is not a TTY.
+    if not sys.stdin.isatty():
+        if config and config.get('nicedates', 'on').lower() == 'on':
+            run_as_stdin_filter(config)
+        else:
+            for line in sys.stdin:
+                sys.stdout.write(line)
+        sys.exit(0)
+
     # Status flag
     if args and args[0] == '--status':
         do_status(rc_path, config)
         sys.exit(0)
 
-    # No args (or dispatched with no task args) → toggle
+    # No args → toggle
     if not args:
         do_toggle(rc_path, config)
         sys.exit(0)
