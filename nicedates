@@ -422,32 +422,13 @@ def replace_dates_in_line(line, now, config, col_width=None):
 
 
 def transform_lines(lines, now, config):
-    """Two-pass date transformation that sizes the date column to actual content.
+    """Single-pass date transformation.
 
-    Pass 1: transform every line at original width, track widest nice date.
-    Pass 2: re-transform with that width so all date fields are consistently sized.
+    Each date field is padded to the original Y-M-D H:N:S width (19 chars)
+    so all columns stay aligned. Column width trimming is a future enhancement.
     Returns list of transformed lines ready to print.
     """
-    pass1 = []
-    max_nice_width = 0
-    for line in lines:
-        transformed, nice_width = replace_dates_in_line(line, now, config)
-        pass1.append((line, transformed, nice_width))
-        if nice_width > max_nice_width:
-            max_nice_width = nice_width
-
-    if max_nice_width == 0:
-        return [t for _, t, _ in pass1]
-
-    result = []
-    for line, transformed, nice_width in pass1:
-        if nice_width == 0:
-            result.append(transformed)
-        else:
-            retransformed, _ = replace_dates_in_line(line, now, config,
-                                                      col_width=max_nice_width)
-            result.append(retransformed)
-    return result
+    return [replace_dates_in_line(line, now, config)[0] for line in lines]
 
 # ============================================================================
 # Task execution via PTY (unchanged from working implementation)
