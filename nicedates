@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 nicedates - Human-friendly date formatting for Taskwarrior reports
-version 1.0.0
+version 1.0.1
 
 Usage:
   nicedates [task args...]   Run task with nice date formatting
@@ -30,6 +30,19 @@ from pathlib import Path
 
 VERSION = "1.0.1"
 SCRIPT_NAME = "nicedates"
+
+# ============================================================================
+# Debug infrastructure  — enabled by NICEDATES_DEBUG=1 (or 2 for verbose)
+# ============================================================================
+
+_DEBUG = int(os.environ.get('NICEDATES_DEBUG', '0')) if True else 0
+
+def dbg(msg, level=1):
+    """Print debug message to stderr if NICEDATES_DEBUG >= level."""
+    # os may not be imported yet at module level, so we re-check inline
+    lvl = int(os.environ.get('NICEDATES_DEBUG', '0'))
+    if lvl >= level:
+        print(f"[nd:{level}] {msg}", file=sys.stderr)
 
 # ============================================================================
 # Non-report task commands (excluded from report detection)
@@ -106,6 +119,7 @@ def get_rc_path():
 def read_rc(rc_path):
     """Parse nicedates.rc into a dict. Returns None if file not found."""
     if not rc_path.exists():
+        dbg(f"RC file NOT FOUND: {rc_path}")
         return None
 
     config = dict(DEFAULTS)  # start with defaults
@@ -119,6 +133,9 @@ def read_rc(rc_path):
                 key, _, val = line.partition('=')
                 config[key.strip()] = val.strip()
 
+    dbg(f"RC loaded: {rc_path}")
+    dbg(f"  nicedates={config.get('nicedates')}", 2)
+    dbg(f"  nice.reports={config.get('nice.reports')}", 2)
     return config
 
 
@@ -160,7 +177,14 @@ def get_reports_list_cached(config):
     if REPORTS_CACHE_PATH.exists():
         age = time.time() - REPORTS_CACHE_PATH.stat().st_mtime
         if age < ttl_seconds:
-            return set(REPORTS_CACHE_PATH.read_text().split())
+            reports = set(REPORTS_CACHE_PATH.read_text().split())
+            dbg(f"Reports cache HIT ({len(reports)} reports, age={age:.0f}s)")
+            dbg(f"  reports={sorted(reports)}", 2)
+            return reports
+        else:
+            dbg(f"Reports cache EXPIRED (age={age:.0f}s > ttl={ttl_seconds:.0f}s)")
+    else:
+        dbg("Reports cache MISS (no cache file)")
 
     # Refresh cache
     try:
@@ -168,6 +192,7 @@ def get_reports_list_cached(config):
             ['task', 'reports'],
             capture_output=True, text=True, timeout=5
         )
+        dbg(f"'task reports' exit={result.returncode}, stdout lines={len(result.stdout.splitlines())}", 2)
         # Parse report names from output — first word of each data line
         reports = set()
         for line in result.stdout.splitlines():
@@ -175,12 +200,14 @@ def get_reports_list_cached(config):
             if parts and parts[0].islower() and parts[0] not in TASK_COMMANDS:
                 reports.add(parts[0])
 
+        dbg(f"Reports parsed: {sorted(reports)}")
         if reports:
             REPORTS_CACHE_PATH.write_text('\n'.join(sorted(reports)))
             return reports
-    except Exception:
-        pass
+    except Exception as e:
+        dbg(f"'task reports' FAILED: {e}")
 
+    dbg("WARNING: reports list is empty — detect_report will always return None!")
     return set()
 
 
@@ -226,30 +253,45 @@ def detect_report(args, known_reports, negatives):
 
     Returns report name or None.
     """
+    dbg(f"detect_report: args={args}")
+    dbg(f"  known_reports={sorted(known_reports)}", 2)
+    dbg(f"  negatives={sorted(negatives)}", 2)
+
     for arg in args:
         # Skip rc overrides
         if arg.startswith('rc.') or arg.startswith('rc:'):
+            dbg(f"  skip '{arg}' (rc override)", 2)
             continue
         # Skip filters: tags, attribute:value, numbers
         if arg.startswith('+') or arg.startswith('-'):
+            dbg(f"  skip '{arg}' (tag/filter prefix)", 2)
             continue
         if ':' in arg:
+            dbg(f"  skip '{arg}' (contains colon)", 2)
             continue
         if arg.isdigit():
+            dbg(f"  skip '{arg}' (digit)", 2)
             continue
         # Skip tw flags
         if arg.startswith('--') or (arg.startswith('-') and len(arg) == 2):
+            dbg(f"  skip '{arg}' (flag)", 2)
             continue
         # Must be lowercase word (report names are lowercase)
         if not re.match(r'^[a-z][a-z0-9_]*$', arg):
+            dbg(f"  skip '{arg}' (not lowercase word)", 2)
             continue
         # Not a non-report command
         if arg in TASK_COMMANDS:
+            dbg(f"  skip '{arg}' (task command, not a report)", 2)
             continue
         # Check against known reports
         if arg in known_reports and arg not in negatives:
+            dbg(f"  MATCHED report: '{arg}'")
             return arg
+        else:
+            dbg(f"  skip '{arg}' (not in known_reports or in negatives)")
 
+    dbg("detect_report: NO report found → passthrough")
     return None
 
 # ============================================================================
@@ -370,7 +412,11 @@ def replace_dates_in_line(line, now, config):
 
     replacements = []  # (start, end, replacement_str) in stripped coords
 
-    for m in DATE_TIME_PATTERN.finditer(stripped):
+    matches = list(DATE_TIME_PATTERN.finditer(stripped))
+    if matches:
+        dbg(f"  line has {len(matches)} date match(es)", 2)
+    
+    for m in matches:
         date_part = m.group(1)
         time_part = m.group(2)
         full_str  = m.group(0)  # "YYYY-MM-DD HH:MM:SS"
@@ -378,6 +424,7 @@ def replace_dates_in_line(line, now, config):
         try:
             dt = datetime.strptime(full_str, '%Y-%m-%d %H:%M:%S')
         except ValueError:
+            dbg(f"  strptime FAILED for: '{full_str}'")
             continue
 
         date_str, time_str = format_nice_date(dt, now, config)
@@ -396,6 +443,7 @@ def replace_dates_in_line(line, now, config):
         elif nice_width > original_width:
             nice = nice[:original_width]
 
+        dbg(f"  '{full_str}' → '{nice}'", 2)
         replacements.append((m.start(), m.end(), nice))
 
     if not replacements:
@@ -436,14 +484,12 @@ def run_task_with_nicedates(args, config):
     # Suppress rc.override messages (and any other configured verbose tokens)
     suppress = config.get('nice.suppress-verbose', 'override').strip()
     if suppress:
-        # Get existing verbose setting, remove suppressed tokens, apply
-        # We inject rc.verbose= to exclude the suppressed token(s).
-        # Format: rc.verbose=all,-override  (start with all, remove token)
         suppress_tokens = [t.strip() for t in suppress.split(',') if t.strip()]
         verbose_val = 'all,' + ','.join(f'-{t}' for t in suppress_tokens)
         rc_overrides.append(f'rc.verbose={verbose_val}')
 
     full_args = rc_overrides + args
+    dbg(f"run_task_with_nicedates: task {' '.join(full_args)}")
 
     now = datetime.now()
 
@@ -451,6 +497,8 @@ def run_task_with_nicedates(args, config):
         rows, cols = os.get_terminal_size()
     except OSError:
         rows, cols = 24, 80
+
+    dbg(f"Terminal size: {cols}x{rows}")
 
     env = os.environ.copy()
     env['COLUMNS'] = str(cols)
@@ -464,6 +512,7 @@ def run_task_with_nicedates(args, config):
         env=env
     )
     os.close(slave)
+    dbg(f"task PID={proc.pid}")
 
     output = b''
     while True:
@@ -486,11 +535,24 @@ def run_task_with_nicedates(args, config):
 
     os.close(master)
     proc.wait()
+    dbg(f"task exit={proc.returncode}, captured {len(output)} bytes")
 
     text = output.decode('utf-8', errors='replace')
-    for line in text.split('\n'):
-        print(replace_dates_in_line(line, now, config))
+    lines = text.split('\n')
+    dbg(f"Output: {len(lines)} lines")
 
+    # Show first few raw lines so we can see what the regex has to work with
+    for i, raw in enumerate(lines[:6]):
+        dbg(f"  raw[{i}]: {repr(raw)}", 2)
+
+    date_hits = 0
+    for line in lines:
+        processed = replace_dates_in_line(line, now, config)
+        if processed != line:
+            date_hits += 1
+        print(processed)
+
+    dbg(f"Date replacements made in {date_hits} line(s)")
     sys.exit(proc.returncode)
 
 
@@ -554,8 +616,9 @@ def run_as_stdin_filter(config):
     sys.stdout.flush()
 
 
-
+def main():
     args = sys.argv[1:]
+    dbg(f"nicedates v{VERSION} args={args}")
 
     # Help / version flags
     if args and args[0] in ('-h', '--help'):
@@ -566,17 +629,21 @@ def run_as_stdin_filter(config):
         sys.exit(0)
 
     rc_path = get_rc_path()
+    dbg(f"RC path: {rc_path}")
     config  = read_rc(rc_path)
 
     # ── Piped stdin filter mode (called by tw as a filter wrapper) ────────────
-    # When tw pipes task output through nicedates, stdin is not a TTY.
     if not sys.stdin.isatty():
+        dbg("stdin is NOT a TTY → filter mode")
         if config and config.get('nicedates', 'on').lower() == 'on':
             run_as_stdin_filter(config)
         else:
+            dbg("nicedates off or no config → passthrough stdin")
             for line in sys.stdin:
                 sys.stdout.write(line)
         sys.exit(0)
+
+    dbg("stdin is a TTY → standalone mode")
 
     # Status flag
     if args and args[0] == '--status':
@@ -592,22 +659,31 @@ def run_as_stdin_filter(config):
 
     # 1. RC file must exist
     if config is None:
+        dbg("No RC file → passthrough")
         run_task_passthrough(args)
 
     # 2. nicedates must be on
     if config.get('nicedates', 'on').lower() != 'on':
+        dbg(f"nicedates={config.get('nicedates')} → passthrough")
         run_task_passthrough(args)
+
+    dbg(f"nicedates is ON")
 
     # 3. Determine selected report set
     reports_str = config.get('nice.reports', DEFAULTS['nice.reports'])
+    dbg(f"nice.reports={reports_str}")
     use_any, positives, negatives = parse_nice_reports(reports_str, config)
+    dbg(f"  use_any={use_any}, positives={positives}, negatives={negatives}")
     known_reports = get_known_reports(use_any, positives, config)
+    dbg(f"  known_reports count={len(known_reports)}")
 
     # 4. Detect if args contain a selected report
     report = detect_report(args, known_reports, negatives)
     if report is None:
+        dbg("No report detected → passthrough")
         run_task_passthrough(args)
 
+    dbg(f"Report detected: '{report}' → running with nicedates")
     # ── All checks passed — run with nicedates ───────────────────────────────
     run_task_with_nicedates(args, config)
 
