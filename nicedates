@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 nicedates - Human-friendly date formatting for Taskwarrior reports
-version 1.0.0
+version 1.0.3
 
 Usage:
   nicedates [task args...]   Run task with nice date formatting
@@ -28,7 +28,7 @@ from pathlib import Path
 # Version
 # ============================================================================
 
-VERSION = "1.0.2"
+VERSION = "1.0.1"
 SCRIPT_NAME = "nicedates"
 
 # ============================================================================
@@ -553,8 +553,31 @@ def run_as_stdin_filter(config):
     """
     Filter mode: read task output from stdin, write transformed output to stdout.
     Used when tw pipes task output through nicedates as a filter wrapper.
-    Collects all lines first for two-pass column-width optimisation.
+    Respects nicedates=on/off toggle and nice.reports= selection.
     """
+    def passthrough():
+        for line in sys.stdin:
+            sys.stdout.write(line)
+        sys.stdout.flush()
+
+    # Honour master toggle
+    if not config or config.get('nicedates', 'on').lower() != 'on':
+        passthrough()
+        return
+
+    # Honour nice.reports — tw sets NICEDATES_REPORT to the invoked report name
+    report = os.environ.get('NICEDATES_REPORT', '').strip()
+    if report:
+        reports_str = config.get('nice.reports', DEFAULTS['nice.reports'])
+        use_any, positives, negatives = parse_nice_reports(reports_str, config)
+        if use_any:
+            known = get_reports_list_cached(config)
+        else:
+            known = positives
+        if report not in known or report in negatives:
+            passthrough()
+            return
+
     now = datetime.now()
     lines = [line.rstrip('\n') for line in sys.stdin]
     for transformed in transform_lines(lines, now, config):
